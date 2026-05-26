@@ -9,8 +9,8 @@ boto3
 pyngrok
 transformers
 accelerate
-bitsandbytes
-sentencepiece
-pdfplumber
 faiss-cpu
 regex
+gunicorn
+gevent
+gevent-websocket
