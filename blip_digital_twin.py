@@ -132,6 +132,7 @@ class BatteryDegradationEngine:
     #     # self.cycle_degradation=cycle_deg
     #     self.cycle_degradation += cycle_deg
 
+
     def cycling_aging(self,data):
         cycle_count=float(data.get("CycleCount",0))
         soc=float(data.get("SOC",50))
@@ -194,6 +195,53 @@ class BatteryDegradationEngine:
 
         self.calendar_degradation += calendar_deg
 
+    def calculate_cell_soh(self, data, pack_soh):
+        total_cells = int(data.get("total_cells",0))
+        cell_soh = {}
+
+        avg_voltage = float(data.get("AverageVol",0))
+        voltage_diff = float(data.get("Voldif",0))
+        mtemp = float(data.get("MTemp",25))
+
+        for i in range(1, total_cells + 1):
+            cell_key = f"Cell_{i}"
+            temp_key = f"Temp{i}"
+            cell_voltage = data.get(cell_key)
+            cell_temp = data.get(temp_key)
+
+            if (cell_voltage is None or cell_temp is None or cell_voltage == "" or cell_temp == ""):
+                cell_soh[f"cell_{i}_soh"] = None
+                continue
+
+            try:
+                cell_voltage = float(cell_voltage)
+                cell_temp = float(cell_temp)
+            except:
+                cell_soh[f"cell_{i}_soh"] = None
+                continue
+
+
+            voltage_deviation=abs(cell_voltage-avg_voltage)
+            voltage_penalty=min(voltage_deviation*2,3)
+            # Small temperature impact
+
+            temp_penalty=min(abs(cell_temp-mtemp)*0.2,2)
+            # imbalance penalty
+            imbalance_penalty=min(voltage_diff*10,3)
+
+            # Cell SoH
+            estimated_cell_soh=(pack_soh-voltage_penalty-temp_penalty-imbalance_penalty)
+            estimated_cell_soh=max(0,min(100,estimated_cell_soh))
+            cell_soh[f"cell_{i}_soh"]=round(estimated_cell_soh,4)
+
+            # voltage_deviation = abs(cell_voltage - avg_voltage)
+            # voltage_factor = (1 - (voltage_deviation/max(avg_voltage,1)))
+            # temp_factor = math.exp(-abs(cell_temp - mtemp) / 40)
+            # imbalance_factor = (1 - min(voltage_diff,1) * 0.05)
+            # estimated_cell_soh = (pack_soh * voltage_factor * temp_factor * imbalance_factor)
+
+        return cell_soh
+
     def process(self,data):
         self.cycling_aging(data)
         self.calendar_aging(data)
@@ -202,55 +250,31 @@ class BatteryDegradationEngine:
         total_soh=max(0,min(100,total_soh))
         current=float(data.get("Current",0))
         output={
-            "timestamp":
-                str(
-                    data.get("Time","")
-                ),
-
-            "soh":
-                round(
-                    total_soh,
-                    4
-                ),
-
-            "battery_capacity_ah":
-                float(
-                    data.get("FullCap",0)
-                ),
-
-            "current_a":
-                current,
-
-            "power_w":
-                float(
-                    data.get("Power(W)",0)
-                ),
-
+            "timestamp":str(data.get("Time","")),
+            "soh":round(total_soh,4),
+            "battery_capacity_ah":float(data.get("FullCap",0)),
+            "current_a":current,
+            "power_w":float(data.get("Power(W)",0)),
             "voltage_v":
                 float(
-                    data.get(
-                        "Voltage(V)",
-                        data.get("TotalVol",0)
+                    data.get("Voltage(V)",data.get("TotalVol",0)
                     )
                 ),
-            "temperature_c":
-                float(
-                    data.get("MTemp",0)
-                ),
-            "charging_state":
-                self.charging_state(
-                    current
-                )
+            "temperature_c":float(data.get("MTemp",0)),
+            "charging_state":self.charging_state(current)
 
         }
+
+        cell_soh = self.calculate_cell_soh(data,total_soh)
+        output.update(cell_soh)
         return output
 
-
 def validate_json(data):
-    required_fields=["battery_type","total_cells"]
+    required_fields=["battery_type","total_cells","Time","Current","SOC","FullCap","RemainCap","Power(W)","MTemp","MaxVol","MinVol","AverageVol","Voldif"]
+
     missing=[]
     for field in required_fields:
-        if field not in data:
+        if (field not in data or data[field] is None):
             missing.append(field)
 
     if missing:
@@ -259,11 +283,13 @@ def validate_json(data):
     n=data["total_cells"]
 
     for i in range(1,n+1):
-        if f"Cell_{i}" not in data:
-            raise Exception(f"Missing Cell_{i}")
+        cell_key=f"Cell_{i}"
+        temp_key=f"Temp{i}"
+        if cell_key not in data:
+            raise Exception(f"Missing {cell_key}")
 
-        if f"Temp{i}" not in data:
-            raise Exception(f"Missing Temp{i}")
+        if temp_key not in data:
+            raise Exception(f"Missing {temp_key}")
 
 
 @app.route("/battery-soh",methods=["POST"])
@@ -313,7 +339,7 @@ def calculate_soh():
     except Exception as e:
         return jsonify({"error":str(e)}),500
 
-@app.route("/health", methods=["GET"])
+@app.route("/health-soh", methods=["GET"])
 def health():
     return jsonify({"status":"healthy"})
 
@@ -369,6 +395,8 @@ def battery_stream(ws):
                     )
                     client_engines[client_id] = engine
                 output = engine.process(data)
+                output["total_cells"]=int(data["total_cells"])
+                output["connection"]="active"
                 ws.send(json.dumps(output))
 
             except Exception as e:
@@ -430,3 +458,4 @@ if __name__ == "__main__":
     except ImportError:
         get_ipython = lambda: None  # Fallback for non-Colab environments
     main()
+
