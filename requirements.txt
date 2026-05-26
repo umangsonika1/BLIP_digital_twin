@@ -1,0 +1,16 @@
+flask
+flask-cors
+flask-sock
+simple-websocket
+websockets
+pandas
+torch
+boto3
+pyngrok
+transformers
+accelerate
+bitsandbytes
+sentencepiece
+pdfplumber
+faiss-cpu
+regex
