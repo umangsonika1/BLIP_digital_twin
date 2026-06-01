@@ -1,41 +1,66 @@
-# syntax=docker/dockerfile:1.6
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — dependency builder
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
 
-# ---------- Base image ----------
-FROM python:3.11-slim AS base
+WORKDIR /build
 
-# Prevent Python from writing .pyc files and enable unbuffered logging
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# System deps (minimal). build-essential is only needed if a wheel must be compiled.
+# Build-time OS deps (needed to compile some Python wheels)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
+        build-essential \
+        gcc \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------- App setup ----------
+COPY requirements.txt .
+
+# Install into an isolated prefix so we can copy only what's needed
+RUN pip install --upgrade pip \
+ && pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 — runtime image
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+# libgomp1 is required at runtime by faiss-cpu / torch
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for security
+RUN useradd --create-home --shell /bin/bash appuser
+
 WORKDIR /app
 
-# Install Python dependencies first (better layer caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
 
-# Copy application code
+# Copy application source
 COPY blip_digital_twin.py .
 
-# ---------- Runtime config ----------
-# Default: production mode, no ngrok. Override with -e USE_NGROK=true -e NGROK_AUTH_TOKEN=...
-ENV PORT=5008 \
-    USE_NGROK=false
+RUN chown -R appuser:appuser /app
+USER appuser
 
-EXPOSE 5008
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime configuration (override with -e or an env_file)
+# ─────────────────────────────────────────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LOG_LEVEL=INFO \
+    AWS_REGION=ap-south-1 \
+    INPUT_STREAM=telemetry-raw \
+    OUTPUT_STREAM=telemetry-processed \
+    STARTING_ITERATOR_TYPE=LATEST \
+    SHARD_DISCOVERY_INTERVAL_SEC=60 \
+    GET_RECORDS_LIMIT=500 \
+    GET_RECORDS_INTERVAL_SEC=1.0 \
+    EMPTY_POLL_BACKOFF_SEC=1.0 \
+    OUTPUT_BATCH_SIZE=100 \
+    OUTPUT_FLUSH_INTERVAL_SEC=1.0 \
+    OUTPUT_MAX_RETRIES=5
 
-# Healthcheck hits the /health endpoint defined in the app
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:${PORT}/health || exit 1
+# No ports to expose — this is a pure background worker
 
-# Run with gunicorn + gevent-websocket worker so flask-sock WebSockets work.
-# Single worker keeps in-memory engine state (client_engines dict) consistent.
-CMD ["sh", "-c", "gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:${PORT} --timeout 120 blip_digital_twin:app"]
+ENTRYPOINT ["python", "blip_digital_twin.py"]
