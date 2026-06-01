@@ -6,6 +6,7 @@ websockets
 pandas
 torch
 boto3
+botocore
 pyngrok
 transformers
 accelerate
@@ -14,3 +15,4 @@ regex
 gunicorn
 gevent
 gevent-websocket
+python-dateutil
