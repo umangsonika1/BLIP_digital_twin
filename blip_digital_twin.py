@@ -45,7 +45,7 @@ log = logging.getLogger("blip-digital-twin")
 # ============================================================================
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
-INPUT_STREAM = os.getenv("INPUT_STREAM", "telemetry-raw")
+INPUT_STREAM = os.getenv("INPUT_STREAM", "telemetry-events")
 OUTPUT_STREAM = os.getenv("OUTPUT_STREAM", "telemetry-output")
 
 SHARD_DISCOVERY_INTERVAL_SEC = int(os.getenv("SHARD_DISCOVERY_INTERVAL_SEC", "60"))
