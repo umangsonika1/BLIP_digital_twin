@@ -5,3 +5,5 @@ botocore
 pyngrok
 regex
 python-dateutil
+paho-mqtt
+python-dotenv
