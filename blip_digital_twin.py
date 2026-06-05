@@ -28,10 +28,7 @@ try:
 except ImportError:
     _HAS_DATEUTIL = False
 
-
-# ============================================================================
 # LOGGING
-# ============================================================================
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -40,9 +37,7 @@ logging.basicConfig(
 log = logging.getLogger("blip-digital-twin")
 
 
-# ============================================================================
 # CONFIG (all overridable via environment variables)
-# ============================================================================
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 INPUT_STREAM = os.getenv("INPUT_STREAM", "telemetry-events")
@@ -65,18 +60,95 @@ OUTPUT_MAX_RETRIES = int(os.getenv("OUTPUT_MAX_RETRIES", "5"))
 STARTING_ITERATOR_TYPE = os.getenv("STARTING_ITERATOR_TYPE", "LATEST")
 
 
-# ============================================================================
 # BATTERY DEGRADATION MODEL
-# ============================================================================
 
 BATTERY_COEFFICIENTS = {
-    "LFP":    {"cycle_coeff": 0.000015, "calendar_coeff": 0.00000005, "activation_energy": 32000},
-    "NMC":    {"cycle_coeff": 0.000025, "calendar_coeff": 0.00000008, "activation_energy": 28000},
-    "NCA":    {"cycle_coeff": 0.00003,  "calendar_coeff": 0.0000001,  "activation_energy": 26000},
-    "Others": {"cycle_coeff": 0.00002,  "calendar_coeff": 0.00000007, "activation_energy": 30000},
+    "LFP": {
+        "cycle_coeff": 0.000015, "calendar_coeff": 0.00000005, "activation_energy": 32000,
+        "soh_fade_per_cycle": 0.005,  "calendar_fade_per_year": 1.5,
+        "base_internal_resistance": 0.030,
+        "cell_overvoltage": 3.65, "cell_undervoltage": 2.50,
+    },
+    "NMC": {
+        "cycle_coeff": 0.000025, "calendar_coeff": 0.00000008, "activation_energy": 28000,
+        "soh_fade_per_cycle": 0.0133, "calendar_fade_per_year": 2.0,
+        "base_internal_resistance": 0.025,
+        "cell_overvoltage": 4.25, "cell_undervoltage": 2.50,
+    },
+    "NCA": {
+        "cycle_coeff": 0.00003,  "calendar_coeff": 0.0000001,  "activation_energy": 26000,
+        "soh_fade_per_cycle": 0.020,  "calendar_fade_per_year": 2.5,
+        "base_internal_resistance": 0.022,
+        "cell_overvoltage": 4.25, "cell_undervoltage": 2.50,
+    },
+    "Others": {
+        "cycle_coeff": 0.00002,  "calendar_coeff": 0.00000007, "activation_energy": 30000,
+        "soh_fade_per_cycle": 0.010,  "calendar_fade_per_year": 2.0,
+        "base_internal_resistance": 0.028,
+        "cell_overvoltage": 4.25, "cell_undervoltage": 2.50,
+    },
 }
 
 GAS_CONSTANT = 8.314  # J/(mol*K)
+
+# Supported chemistries. Missing battery_type -> NMC default; any unsupported value -> Others.
+SUPPORTED_CHEMISTRIES = ("LFP", "NMC", "NCA")
+DEFAULT_CHEMISTRY = "NMC"
+
+# Initial-SoH estimate floor. Cycle/calendar history is only a rough starting estimate,
+INITIAL_SOH_FLOOR = 50.0
+
+# Charging-state detection thresholds.
+IDLE_CURRENT_THRESHOLD_A = 0.10   
+FULL_SOC_THRESHOLD = 99.0         
+SOC_TREND_THRESHOLD = 0.5         
+VOLTAGE_TREND_THRESHOLD = 0.01   
+VOLDIF_FAULT_MV = 500.0           
+
+# Per-cell temperature estimation.
+CELL_TEMP_DEV_GAIN = 300.0       
+CELL_TEMP_MAX_SPREAD = 5.0        
+CELL_TEMP_LOAD_GAIN = 0.10       
+CELL_TEMP_LOAD_MAX = 6.0          
+CELL_TEMP_SMOOTHING = 0.30        
+
+# Per-cell internal-resistance estimation.
+IR_GROWTH_K = 1.5                
+IR_MIN_FACTOR = 0.5               
+IR_MAX_FACTOR = 4.0               
+IR_SMOOTHING = 0.30              
+
+# Operating-condition (cycling) aging: scales the chemistry fade-per-cycle by stress.
+CYCLE_TEMP_REF_C = 25.0
+CYCLE_TEMP_SCALE_C = 20.0           # ~e-fold extra aging per this many degC above reference
+CYCLE_DOD_K = 0.5
+CYCLE_CRATE_K = 0.3
+CYCLE_VSTRESS_K = 5.0
+CYCLE_STRESS_CAP = 5.0             # never multiply nominal fade by more than this
+
+# Capacity-based correction of pack SoH: gentle, deadbanded, time-bounded so that
+CAP_SOH_DEADBAND_PCT = 3.0               
+CAP_CORRECTION_FRACTION = 0.05           
+CAP_CORRECTION_RATE_PCT_PER_HOUR = 0.5   
+
+# Per-cell SoH = relative health index anchored to pack SoH (bounded, not accumulated).
+CELL_R_PENALTY_PCT = 15.0                
+CELL_V_PENALTY_PCT_PER_VOLT = 60.0      
+CELL_SOH_MAX_PENALTY_PCT = 20.0          
+CELL_SOH_SMOOTHING = 0.05             
+
+
+def normalize_battery_type(value):
+    """Missing/empty -> NMC default; LFP/NMC/NCA pass through; anything else -> Others."""
+    if value is None:
+        return DEFAULT_CHEMISTRY
+    s = str(value).strip().upper()
+    if not s:
+        return DEFAULT_CHEMISTRY
+    if s in SUPPORTED_CHEMISTRIES:
+        return s
+    return "Others"
+
 DOD_STRESS_EXPONENT1 = 2.0      
 CRATE_STRESS_SLOPE1 = 0.7       
 CYCLE_TEMP_EA1 = 18000 
@@ -121,214 +193,341 @@ def _plating_factor1(temp_c: float, c_rate: float, is_charging: bool) -> float:
 
 
 class BatteryDegradationEngine:
-    """
-    Stateful per-pack degradation calculator. NOT thread-safe by itself —
-    callers must hold a per-pack lock when calling process(). EngineStore
-    handles that.
-    """
 
-    def __init__(self, battery_type: str = "Others", initial_soh: float = 100.0):
-        self.battery_type = battery_type
-        self.initial_soh = float(initial_soh)
-        self.coeff = BATTERY_COEFFICIENTS.get(battery_type, BATTERY_COEFFICIENTS["Others"])
-        self.cycle_degradation = 0.0
-        self.calendar_degradation = 0.0
-        self.energy_throughput = 0.0
+    def __init__(self, battery_type=None):
+        self.battery_type = normalize_battery_type(battery_type)
+        self.coeff = BATTERY_COEFFICIENTS.get(self.battery_type, BATTERY_COEFFICIENTS["Others"])
+
+        # Estimated lazily on the first processed snapshot (CycleCount-driven).
+        self.initial_soh: Optional[float] = None
+        self.soh_state: Optional[float] = None  
+        self.cycle_degradation = 0.0             
+        self.calendar_degradation = 0.0          
+        self.energy_throughput = 0.0             
         self.last_timestamp: Optional[datetime] = None
-        self.temperature_history = deque(maxlen=1000)
-        self.soc_history = deque(maxlen=1000)
-        self.cell_degradation: Dict[int, float] = {}
         self.last_cell_voltage: Dict[int, float] = {}
-        self.last_cell_temp: Dict[int, float] = {}
+        self.cell_temp_smoothed: Dict[int, float] = {}
+        self.cell_resistance_smoothed: Dict[int, float] = {}
+        self.cell_soh_smoothed: Dict[int, float] = {}
 
+    # Small input helpers
     @staticmethod
-    def charging_state(current: float) -> str:
-        if current > 0:
-            return "Charging"
-        if current < 0:
-            return "Discharging"
-        return "Idle"
+    def _to_float(value: Any, default: float) -> float:
+        try:
+            if value is None or value == "":
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
-    def cycling_aging(self, data: Dict[str, Any]) -> None:
-        soc = float(data.get("SOC", 50))
-        current = abs(float(data.get("Current", 0)))
-        power = abs(float(data.get("Power(W)", 0)))
-        remain_cap = float(data.get("RemainCap", 1))
-        full_cap = float(data.get("FullCap", 1))
-        max_vol = float(data.get("MaxVol", 0))
-        min_vol = float(data.get("MinVol", 0))
-        avg_temp = float(data.get("MTemp", 25))
+    def _anchor_temp(self, data: Dict[str, Any]) -> float:
+        """Best available pack-temperature anchor: MOS temp, else ambient, else 25C."""
+        mos = data.get("MosTemp_c", data.get("MOSTemp_c"))
+        t = self._to_float(mos, float("nan"))
+        if not math.isnan(t):
+            return t
+        t = self._to_float(data.get("ambient_temp"), float("nan"))
+        if not math.isnan(t):
+            return t
+        return 25.0
 
-        dod = (100 - soc) / 100
-        c_rate = current / max(full_cap, 1)
-        capacity_fade = max(0.0, (full_cap - remain_cap) / max(full_cap, 1))
-        voltage_stress = max_vol - min_vol
-        temperature_factor = math.exp((avg_temp - 25) / 30)
+    def _cell_voltages(self, data: Dict[str, Any], total_cells: int) -> List[float]:
+        """Collect cell voltages, falling back to last-known then the pack average."""
+        pack_voltage = self._to_float(data.get("Voltage(V)", data.get("TotalVol")), 0.0)
+        pack_avg = pack_voltage / total_cells if total_cells > 0 else 0.0
+        voltages: List[float] = []
+        for i in range(1, total_cells + 1):
+            raw = data.get(f"Cell_{i}")
+            if raw is not None and raw != "":
+                try:
+                    v = float(raw)
+                    self.last_cell_voltage[i] = v
+                except (TypeError, ValueError):
+                    v = self.last_cell_voltage.get(i, pack_avg)
+            else:
+                v = self.last_cell_voltage.get(i, pack_avg)
+            voltages.append(v)
+        return voltages
 
-        self.energy_throughput += power / 3600
-        throughput_factor = 1 + self.energy_throughput / (full_cap * max(max_vol, 1) * 1000)
+    def _design_capacity(self, data: Dict[str, Any]) -> float:
+        return max(self._to_float(data.get("DesignCap"), 0.0), 0.0)
 
-        incremental_deg = (
-            self.coeff["cycle_coeff"]
-            * (1 + dod)
-            * (1 + c_rate)
-            * (1 + capacity_fade)
-            * (1 + voltage_stress)
-            * temperature_factor
-            * throughput_factor
-            * (power / 1000)
-            / 3600
-        )
-        self.cycle_degradation += incremental_deg
+    def _estimated_full_capacity(self, data: Dict[str, Any]) -> Optional[float]:
+        """Approximate present full capacity from RemainCap and SOC (reliable mid-SOC)."""
+        soc = self._to_float(data.get("SOC"), 0.0)
+        remain = self._to_float(data.get("RemainCap"), 0.0)
+        if soc <= 5.0 or remain <= 0.0:
+            return None
+        return remain / (soc / 100.0)
 
-    def calendar_aging(self, data: Dict[str, Any]) -> None:
+    def _elapsed_hours(self, data: Dict[str, Any]) -> float:
+        """Hours since the previous snapshot, from the Time field. 0 on the first
+        snapshot or when timestamps are out of order / non-advancing."""
         ts = _parse_timestamp(data.get("Time")) or datetime.now(timezone.utc)
         if ts.tzinfo is not None:
             ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
-
         if self.last_timestamp is None:
             self.last_timestamp = ts
-            return
-
+            return 0.0
         elapsed = (ts - self.last_timestamp).total_seconds()
-        if elapsed < 0:
-            log.debug("Out-of-order timestamp (elapsed=%.2fs); skipping calendar increment", elapsed)
-            return
+        if elapsed <= 0:
+            if elapsed < 0:
+                log.debug("Out-of-order timestamp (elapsed=%.2fs); treating as 0", elapsed)
+            return 0.0
         self.last_timestamp = ts
+        return elapsed / 3600.0
 
-        temp = float(data.get("MTemp", 25))
-        soc = float(data.get("SOC", 50))
+    # Initial SoH from cycle history (CycleCount is the primary indicator)
+    def estimate_initial_soh(self, data: Dict[str, Any]) -> float:
+        # Cycle aging: chemistry fade-per-cycle x CycleCount.
+        cycle_count = self._to_float(data.get("CycleCount"), 0.0)
+        cycle_fade = self.coeff["soh_fade_per_cycle"] * max(cycle_count, 0.0)
+
+        # Calendar aging: degradation accrues with shelf/field age since the
+        # production date even when CycleCount is 0.
+        calendar_fade = 0.0
+        prod = _parse_timestamp(data.get("production_date"))
+        now = _parse_timestamp(data.get("Time")) or datetime.now(timezone.utc)
+        if prod is not None:
+            if prod.tzinfo is not None:
+                prod = prod.astimezone(timezone.utc).replace(tzinfo=None)
+            if now.tzinfo is not None:
+                now = now.astimezone(timezone.utc).replace(tzinfo=None)
+            age_years = max((now - prod).total_seconds(), 0.0) / (365.25 * 86400.0)
+            calendar_fade = self.coeff["calendar_fade_per_year"] * age_years
+
+        initial = 100.0 - cycle_fade - calendar_fade
+        return max(INITIAL_SOH_FLOOR, min(100.0, initial))
+    
+    # Charging-state inference (current direction + trend + faults)
+    def charging_state(self, current: float) -> str:
+        """Charging when current is positive, Discharging when negative, and Idle
+        when current is within a small dead-band around zero."""
+        if current > IDLE_CURRENT_THRESHOLD_A:
+            return "Charging"
+        if current < -IDLE_CURRENT_THRESHOLD_A:
+            return "Discharging"
+        return "Idle"
+
+    # Live operating-condition aging (returns the SoH decrement for this step)
+    def cycling_increment(self, data: Dict[str, Any], elapsed_hours: float) -> float:
+        if elapsed_hours <= 0:
+            return 0.0
+        current = abs(self._to_float(data.get("Current"), 0.0))
+        if current <= 0:
+            return 0.0
+
+        cap_ref = self._estimated_full_capacity(data) or self._design_capacity(data) or 1.0
+        cap_ref = max(cap_ref, 1e-6)
+
+        delta_ah = current * elapsed_hours
+        delta_efc = delta_ah / cap_ref                 # equivalent full cycles this step
+
+        soc = self._to_float(data.get("SOC"), 50.0)
+        dod = max(0.0, (100 - soc) / 100)
+        c_rate = current / cap_ref
+        max_vol = self._to_float(data.get("MaxVol"), 0.0)
+        min_vol = self._to_float(data.get("MinVol"), 0.0)
+        voltage_stress = max(0.0, max_vol - min_vol)
+        anchor_temp = self._anchor_temp(data)
+        is_charging = self._to_float(data.get("Current"), 0.0) > 0
+
+        temp_factor = math.exp((anchor_temp - CYCLE_TEMP_REF_C) / CYCLE_TEMP_SCALE_C)
+        dod_factor = 1 + CYCLE_DOD_K * dod
+        crate_factor = 1 + CYCLE_CRATE_K * c_rate
+        vstress_factor = 1 + CYCLE_VSTRESS_K * voltage_stress
+        plating = _plating_factor1(anchor_temp, c_rate, is_charging)
+        stress = min(CYCLE_STRESS_CAP,
+                     temp_factor * dod_factor * crate_factor * vstress_factor * plating)
+
+        inc = self.coeff["soh_fade_per_cycle"] * delta_efc * stress
+        self.cycle_degradation += inc
+        self.energy_throughput += delta_ah
+        return inc
+
+    def calendar_increment(self, data: Dict[str, Any], elapsed_hours: float) -> float:
+        if elapsed_hours <= 0:
+            return 0.0
+        temp = self._anchor_temp(data)
+        soc = self._to_float(data.get("SOC"), 50.0)
         temp_kelvin = temp + 273.15
         arrhenius = math.exp(-self.coeff["activation_energy"] / (GAS_CONSTANT * temp_kelvin))
         soc_factor = 1 + (soc / 100)
+        inc = self.coeff["calendar_coeff"] * (elapsed_hours * 3600.0) * arrhenius * soc_factor
+        self.calendar_degradation += inc
+        return inc
 
-        self.calendar_degradation += (
-            self.coeff["calendar_coeff"] * elapsed * arrhenius * soc_factor
-        )
+    # Per-cell temperature estimate
+    def estimate_cell_temperatures(self, voltages: List[float], avg_voltage: float,
+                                   anchor_temp: float, current: float) -> Dict[int, float]:
+        """Anchor on MOS temp (+ shared load heating); cells that deviate more from
+        the average voltage are assumed to run slightly hotter. Offsets are clamped
+        and EMA-smoothed to avoid an unrealistic spread."""
+        load_rise = min(CELL_TEMP_LOAD_MAX, abs(current) * CELL_TEMP_LOAD_GAIN)
+        base = anchor_temp + load_rise
+        temps: Dict[int, float] = {}
+        for idx, v in enumerate(voltages, start=1):
+            offset = (v - avg_voltage) * CELL_TEMP_DEV_GAIN
+            offset = max(-CELL_TEMP_MAX_SPREAD, min(CELL_TEMP_MAX_SPREAD, offset))
+            raw = base + abs(offset)
+            prev = self.cell_temp_smoothed.get(idx)
+            smoothed = raw if prev is None else (
+                CELL_TEMP_SMOOTHING * raw + (1 - CELL_TEMP_SMOOTHING) * prev
+            )
+            self.cell_temp_smoothed[idx] = smoothed
+            temps[idx] = smoothed
+        return temps
 
-    def calculate_cell_soh(self, data: Dict[str, Any], pack_soh: float) -> Dict[str, Optional[float]]:
-        total_cells = int(data.get("total_cells", 0))
-        cell_soh: Dict[str, Optional[float]] = {}
+    # Per-cell internal resistance estimate (scaled off PACK SoH, not cell SoH)
+    def estimate_cell_resistance(self, voltages: List[float], avg_voltage: float,
+                                 current_signed: float, pack_soh: float) -> Dict[int, float]:
+        """Chemistry base resistance, grown as the pack ages, plus a sign-aware load
+        term: under load a cell that sags (discharge) or peaks (charge) relative to
+        the average implies higher resistance. Clamped and EMA-smoothed."""
+        base_r = self.coeff["base_internal_resistance"]
+        growth = 1 + IR_GROWTH_K * max(0.0, (100.0 - pack_soh) / 100.0)
+        base = base_r * growth
+        resistances: Dict[int, float] = {}
+        for idx, v in enumerate(voltages, start=1):
+            r = base
+            if abs(current_signed) > IDLE_CURRENT_THRESHOLD_A:
+                r += (v - avg_voltage) / current_signed
+            r = max(base_r * IR_MIN_FACTOR, min(base_r * IR_MAX_FACTOR, r))
+            prev = self.cell_resistance_smoothed.get(idx)
+            smoothed = r if prev is None else (
+                IR_SMOOTHING * r + (1 - IR_SMOOTHING) * prev
+            )
+            self.cell_resistance_smoothed[idx] = smoothed
+            resistances[idx] = smoothed
+        return resistances
 
-        avg_voltage = float(data.get("AverageVol", 0))
-        voltage_diff = float(data.get("Voldif", 0))
-        mtemp = float(data.get("MTemp", 25))
+    # Per-cell SoH: bounded relative-health index anchored to pack SoH
+    def calculate_cell_soh(self, voltages: List[float], avg_voltage: float,
+                           resistances: Dict[int, float], pack_soh: float) -> Dict[int, float]:
+        if resistances:
+            avg_r = sum(resistances.values()) / len(resistances)
+        else:
+            avg_r = self.coeff["base_internal_resistance"]
+        avg_r = max(avg_r, 1e-9)
 
-        for i in range(1, total_cells + 1):
+        cell_soh: Dict[int, float] = {}
+        for idx, cell_voltage in enumerate(voltages, start=1):
+            r = resistances.get(idx, avg_r)
+            r_excess = max(0.0, (r - avg_r) / avg_r)            # fractional R above pack avg
+            v_below = max(0.0, avg_voltage - cell_voltage)      # volts under the average
 
-            cell_voltage_raw = data.get(f"Cell_{i}")
-            cell_temp_raw = data.get(f"Temp{i}")
+            penalty = CELL_R_PENALTY_PCT * r_excess + CELL_V_PENALTY_PCT_PER_VOLT * v_below
+            penalty = min(CELL_SOH_MAX_PENALTY_PCT, penalty)
 
-            # -------------------------------
-            # Use last known values if missing
-            # -------------------------------
-            if cell_voltage_raw not in (None, ""):
-                try:
-                    cell_voltage = float(cell_voltage_raw)
-                    self.last_cell_voltage[i] = cell_voltage
-                except (TypeError, ValueError):
-                    cell_voltage = self.last_cell_voltage.get(i)
-            else:
-                cell_voltage = self.last_cell_voltage.get(i)
-
-            if cell_temp_raw not in (None, ""):
-                try:
-                    cell_temp = float(cell_temp_raw)
-                    self.last_cell_temp[i] = cell_temp
-                except (TypeError, ValueError):
-                    cell_temp = self.last_cell_temp.get(i)
-            else:
-                cell_temp = self.last_cell_temp.get(i)
-
-            # If no historical value exists yet, use pack averages
-            if cell_voltage is None:
-                cell_voltage = avg_voltage
-
-            if cell_temp is None:
-                cell_temp = mtemp
-
-            if i not in self.cell_degradation:
-                self.cell_degradation[i] = 0.0
-
-            voltage_deviation = abs(cell_voltage - avg_voltage)
-            temp_deviation = abs(cell_temp - mtemp)
-
-            incremental = (0.000001 + voltage_deviation * 0.000002 + temp_deviation * 0.000001 + voltage_diff * 0.000001)
-            self.cell_degradation[i] += incremental
-            est = pack_soh - self.cell_degradation[i]
-            est = max(0.0, min(pack_soh, est))
-
-            cell_soh[f"cell_{i}_soh"] = round(est, 4)
-
+            raw = max(0.0, min(pack_soh, pack_soh - penalty))
+            prev = self.cell_soh_smoothed.get(idx)
+            smoothed = raw if prev is None else (
+                CELL_SOH_SMOOTHING * raw + (1 - CELL_SOH_SMOOTHING) * prev
+            )
+            self.cell_soh_smoothed[idx] = smoothed
+            cell_soh[idx] = smoothed
         return cell_soh
 
+    # Main entrypoint
     def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        self.cycling_aging(data)
-        self.calendar_aging(data)
+        if self.initial_soh is None:
+            self.initial_soh = self.estimate_initial_soh(data)
+            self.soh_state = self.initial_soh
+            log.info("Estimated initial SoH=%.2f%% (type=%s, cycles=%s)",
+                     self.initial_soh, self.battery_type, data.get("CycleCount"))
 
-        # total_soh = self.initial_soh - self.cycle_degradation - self.calendar_degradation
-        # total_soh = max(0.0, min(100.0, total_soh))
+        total_cells = int(self._to_float(data.get("total_cells"), 0))
+        current_signed = self._to_float(data.get("Current"), 0.0)
+        max_vol = self._to_float(data.get("MaxVol"), 0.0)
+        min_vol = self._to_float(data.get("MinVol"), 0.0)
+        anchor_temp = self._anchor_temp(data)
 
-        model_soh = self.initial_soh - self.cycle_degradation - self.calendar_degradation
-        design_cap = float(data.get("DesignCap", 1))
-        # capacity_soh = (float(data.get("FullCap", 0))/ max(float(data.get("DesignCap", 1)), 1)) * 100
-        if design_cap > 0:
-            capacity_soh = (float(data.get("FullCap", 0))/ design_cap) * 100
+        # --- pack SoH: predict (degradation) then gently correct (capacity) ---
+        elapsed_hours = self._elapsed_hours(data)
+        self.soh_state -= self.cycling_increment(data, elapsed_hours)
+        self.soh_state -= self.calendar_increment(data, elapsed_hours)
+
+        design_cap = self._design_capacity(data)
+        est_full = self._estimated_full_capacity(data)
+        if est_full is not None and design_cap > 0 and elapsed_hours > 0:
+            capacity_soh = max(0.0, min(110.0, (est_full / design_cap) * 100.0))
+            soc = self._to_float(data.get("SOC"), 0.0)
+            reliability = max(0.0, min(1.0, (soc - 20.0) / 40.0))
+            diff = capacity_soh - self.soh_state
+            if reliability > 0 and abs(diff) > CAP_SOH_DEADBAND_PCT:
+                max_pull = CAP_CORRECTION_RATE_PCT_PER_HOUR * elapsed_hours
+                pull = diff * CAP_CORRECTION_FRACTION * reliability
+                pull = max(-max_pull, min(max_pull, pull))
+                self.soh_state += pull
+
+        self.soh_state = max(0.0, min(100.0, self.soh_state))
+        pack_soh = self.soh_state
+
+        # --- cells ---
+        voltages = self._cell_voltages(data, total_cells)
+        if voltages:
+            avg_voltage = sum(voltages) / len(voltages)
         else:
-            capacity_soh = model_soh
-        total_soh = max(model_soh, capacity_soh)
-        total_soh = max(0.0, min(100.0, total_soh))
+            pack_voltage = self._to_float(data.get("Voltage(V)", data.get("TotalVol")), 0.0)
+            avg_voltage = pack_voltage / total_cells if total_cells > 0 else 0.0
 
-        current = float(data.get("Current", 0))
+        cell_temps = self.estimate_cell_temperatures(voltages, avg_voltage, anchor_temp, current_signed)
+        cell_res = self.estimate_cell_resistance(voltages, avg_voltage, current_signed, pack_soh)
+        cell_soh = self.calculate_cell_soh(voltages, avg_voltage, cell_res, pack_soh)
+
+        state = self.charging_state(current_signed)
+
+        pack_voltage = self._to_float(data.get("Voltage(V)", data.get("TotalVol")), 0.0)
+        est_pack_temp = (sum(cell_temps.values()) / len(cell_temps)) if cell_temps else anchor_temp
+        amb_raw = data.get("ambient_temp")
+        ambient_temp_c = float(amb_raw) if amb_raw not in (None, "") else None
+
         output: Dict[str, Any] = {
             "timestamp": str(data.get("Time", "")),
-            "soh": round(total_soh, 4),
-            "battery_capacity_ah": float(data.get("FullCap", 0)),
-            "current_a": current,
-            "power_w": float(data.get("Power(W)", 0)),
-            "voltage_v": float(data.get("Voltage(V)", data.get("TotalVol", 0))),
-            "temperature_c": float(data.get("MTemp", 0)),
-            "charging_state": self.charging_state(current),
-            "total_cells": int(data.get("total_cells", 0)),
+            "battery_type": self.battery_type,
+            "charging_state": state,
+            "soh": round(pack_soh, 4),
+            "cycle_count": self._to_float(data.get("CycleCount"), 0.0),
+            "soc": self._to_float(data.get("SOC"), 0.0),
+            "voltage_v": pack_voltage,
+            "current_a": current_signed,
+            "power_w": self._to_float(data.get("Power(W)"), 0.0),
+            "remaining_capacity_ah": self._to_float(data.get("RemainCap"), 0.0),
+            "ambient_temp_c": ambient_temp_c,
+            "estimated_pack_temp_c": round(est_pack_temp, 2),
+            "total_cells": total_cells,
         }
-        output.update(self.calculate_cell_soh(data, total_soh))
+
+        for i in range(1, total_cells + 1):
+            output[f"cell_{i}_soh"] = round(cell_soh.get(i, pack_soh), 4)
+            output[f"cell_{i}_internal_resistance_mohm"] = round(cell_res.get(i, 0.0) * 1000.0, 3)
+            output[f"cell_{i}_temp_c"] = round(cell_temps.get(i, anchor_temp), 2)
+
         return output
 
 
 def validate_snapshot(data: Dict[str, Any]) -> None:
-    """Raise ValueError if the snapshot is missing required fields."""
-    required = [
-        "pack_id", "battery_type", "total_cells", "Time", "Current", "SOC",
-        "FullCap", "RemainCap", "DesignCap", "Power(W)", "MTemp", "MaxVol", "MinVol",
-        "AverageVol", "Voldif",
-    ]
-    missing = [f for f in required if f not in data or data[f] is None]
-    if missing:
-        raise ValueError(f"Missing fields: {missing}")
+    if "total_cells" not in data or data["total_cells"] is None:
+        raise ValueError("Missing field: total_cells")
 
     try:
         n = int(data["total_cells"])
     except (TypeError, ValueError):
         raise ValueError(f"total_cells is not an integer: {data['total_cells']!r}")
 
-    for i in range(1, n + 1):
-        if f"Cell_{i}" not in data:
-            raise ValueError(f"Missing Cell_{i}")
-        if f"Temp{i}" not in data:
-            raise ValueError(f"Missing Temp{i}")
+    if n <= 0:
+        raise ValueError(f"total_cells must be positive: {n}")
 
+    missing_cells = [
+        f"Cell_{i}" for i in range(1, n + 1)
+        if f"Cell_{i}" not in data or data[f"Cell_{i}"] is None
+    ]
+    if missing_cells:
+        raise ValueError(f"Missing cell voltages: {missing_cells}")
 
-# ============================================================================
 # ENGINE STORE — per-pack engine instances guarded by per-pack locks
-# ============================================================================
 
 class EngineStore:
-    """
-    Thread-safe registry of per-pack engines. Each pack_id gets its own lock
-    so different packs run in parallel across shard threads, while records
-    for the same pack are processed serially.
-    """
-
     def __init__(self) -> None:
         self._engines: Dict[str, BatteryDegradationEngine] = {}
         self._pack_locks: Dict[str, threading.Lock] = {}
@@ -346,14 +545,13 @@ class EngineStore:
             return lock
 
     def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        pack_id = str(data["pack_id"])
+        pack_id = str(data.get("pack_id") or data.get("hardware_version") or "default")
         lock = self._lock_for(pack_id)
         with lock:
             engine = self._engines.get(pack_id)
             if engine is None:
                 engine = BatteryDegradationEngine(
-                    battery_type=data.get("battery_type", "Others"),
-                    initial_soh=float(data.get("initial_soh", 100)),
+                    battery_type=data.get("battery_type"),
                 )
                 self._engines[pack_id] = engine
                 log.info("Created engine for pack_id=%s type=%s", pack_id, engine.battery_type)
@@ -361,19 +559,9 @@ class EngineStore:
         result["pack_id"] = pack_id
         return result
 
-
-# ============================================================================
 # OUTPUT PUBLISHER — batched PutRecords with partial-failure retry
-# ============================================================================
 
 class OutputPublisher:
-    """
-    Buffers processed snapshots and flushes them to OUTPUT_STREAM in batches
-    using put_records. A background thread flushes on a time threshold;
-    enqueue() also triggers an immediate flush when the buffer reaches
-    OUTPUT_BATCH_SIZE. Partial failures are retried with exponential
-    backoff + jitter.
-    """
 
     def __init__(self, kinesis_client, stream_name: str, stop_event: threading.Event):
         self._kinesis = kinesis_client
@@ -489,10 +677,7 @@ class OutputPublisher:
                     break
             self._flush_once()
 
-
-# ============================================================================
 # SHARD CONSUMER — one thread per shard
-# ============================================================================
 
 class ShardConsumer(threading.Thread):
     """Polls a single shard, processes records, enqueues output for publishing."""
@@ -614,17 +799,9 @@ class ShardConsumer(threading.Thread):
 
         self._publisher.enqueue(result)
 
-
-# ============================================================================
 # CONSUMER MANAGER — shard discovery and lifecycle
-# ============================================================================
 
 class ConsumerManager:
-    """
-    Owns the set of ShardConsumer threads. Periodically re-lists shards and
-    starts consumers for any new ones (e.g. children from a reshard). Reaps
-    consumers whose shards have closed.
-    """
 
     def __init__(self, kinesis_client, stream_name: str):
         self._kinesis = kinesis_client
@@ -709,17 +886,9 @@ class ConsumerManager:
     def stop(self) -> None:
         self._stop.set()
 
-
-# ============================================================================
 # ENTRYPOINT
-# ============================================================================
 
 def build_kinesis_client():
-    """
-    Build a boto3 Kinesis client. Credentials are picked up from the standard
-    AWS chain (env vars, EC2/ECS/Lambda role, ~/.aws/credentials). Adaptive
-    retry mode handles transient throttling at the SDK layer.
-    """
     return boto3.client(
         "kinesis",
         region_name=AWS_REGION,
