@@ -15,6 +15,7 @@ import signal
 import logging
 import threading
 import random
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -616,6 +617,10 @@ class EngineStore:
 
         pack_id = str(in_payload.get("pack_id") or raw.get("pack_id"))
         recorded_at = in_payload.get("recorded_at", "")
+        # tenant_id echoed verbatim from input; check payload, envelope, then raw.
+        tenant_id = (in_payload.get("tenant_id")
+                     or event.get("tenant_id")
+                     or raw.get("tenant_id"))
         nominal_voltage_v = in_payload.get("nominal_voltage_v")
         if nominal_voltage_v is None:
             nominal_voltage_v = BatteryDegradationEngine._to_float(raw.get("nominal_voltage_v"), 0.0)
@@ -625,10 +630,9 @@ class EngineStore:
         )
         delta_v = round(float(nominal_voltage_v) - pack_voltage_v, 2)
 
-        # event_id = sha256(pack_id || recorded_at || model_version)
-        event_id = hashlib.sha256(
-            f"{pack_id}{recorded_at}{MODEL_VERSION}".encode("utf-8")
-        ).hexdigest()
+        # event_id: deterministic UUIDv5 over (pack_id, recorded_at) for idempotency.
+        # BLIP requires a UUID here, not a SHA-256 hex string.
+        event_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{pack_id}:{recorded_at}"))
 
         occurred_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") \
             + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
@@ -636,9 +640,10 @@ class EngineStore:
         soc = BatteryDegradationEngine._to_float(raw.get("SOC"), 0.0)
         current_ma = int(round(BatteryDegradationEngine._to_float(raw.get("Current"), 0.0) * 1000.0))
         pack_voltage_mv = int(round(pack_voltage_v * 1000.0))
-        pack_temp_c = round(computed["estimated_pack_temp_c"], 1)
+        # Temperatures: int deci-degrees Celsius (0.1 degC), matching the mV convention.
+        pack_temp_c = int(round(computed["estimated_pack_temp_c"] * 10.0))
         amb_raw = raw.get("ambient_temp")
-        ambient_temp_c = round(float(amb_raw), 1) if amb_raw not in (None, "") else None
+        ambient_temp_c = int(round(float(amb_raw) * 10.0)) if amb_raw not in (None, "") else None
         cycle_count = int(BatteryDegradationEngine._to_float(raw.get("CycleCount"), 0.0))
 
         # Per-cell capacity: predicted (present) capacity = nominal * SoH/100.
@@ -655,16 +660,19 @@ class EngineStore:
                 for nom, soh in zip(cell_capacity_nominal_ah, cell_soh_pct)
             ]
 
+        # Per-cell temps: convert engine floats (degC) to int deci-degrees (0.1 degC).
+        cell_temps_dc = [int(round(float(t) * 10.0)) for t in computed["cell_temps_c"]]
+
         out_payload: Dict[str, Any] = {
             "pack_id": pack_id,
-            "tenant_id": in_payload.get("tenant_id"),
+            "tenant_id": tenant_id,
             "recorded_at": recorded_at,
 
             "chemistry": in_payload.get("chemistry"),
             "nominal_voltage_v": nominal_voltage_v,
 
             "cell_voltages_mv": computed["cell_voltages_mv"],
-            "cell_temps_c": computed["cell_temps_c"],
+            "cell_temps_c": cell_temps_dc,
             "cell_soh_pct": computed["cell_soh_pct"],
             "cell_ir_mohm": computed["cell_ir_mohm"],
             "cell_capacity_nominal_ah": cell_capacity_nominal_ah,
@@ -686,7 +694,7 @@ class EngineStore:
         return {
             "event_id": event_id,
             "event_type": OUTPUT_EVENT_TYPE,
-            "tenant_id": event.get("tenant_id"),
+            "tenant_id": tenant_id,
             "occurred_at": occurred_at,
             "event_version": event.get("event_version"),
             "payload": out_payload,
