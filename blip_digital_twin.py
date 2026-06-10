@@ -10,6 +10,7 @@ import os
 import json
 import math
 import time
+import hashlib
 import signal
 import logging
 import threading
@@ -58,6 +59,10 @@ OUTPUT_MAX_RETRIES = int(os.getenv("OUTPUT_MAX_RETRIES", "5"))
 # LATEST: only new records arriving after consumer start.
 # TRIM_HORIZON: everything still retained in the stream.
 STARTING_ITERATOR_TYPE = os.getenv("STARTING_ITERATOR_TYPE", "LATEST")
+
+# Output event metadata
+MODEL_VERSION = os.getenv("MODEL_VERSION", "soh-v1.2.3")
+OUTPUT_EVENT_TYPE = "telemetry.enriched"
 
 
 # BATTERY DEGRADATION MODEL
@@ -473,57 +478,88 @@ class BatteryDegradationEngine:
 
         cell_temps = self.estimate_cell_temperatures(voltages, avg_voltage, anchor_temp, current_signed)
         cell_res = self.estimate_cell_resistance(voltages, avg_voltage, current_signed, pack_soh)
-        cell_soh = self.calculate_cell_soh(voltages, avg_voltage, cell_res, pack_soh)
+        cell_soh_map = self.calculate_cell_soh(voltages, avg_voltage, cell_res, pack_soh)
 
         state = self.charging_state(current_signed)
 
         pack_voltage = self._to_float(data.get("Voltage(V)", data.get("TotalVol")), 0.0)
         est_pack_temp = (sum(cell_temps.values()) / len(cell_temps)) if cell_temps else anchor_temp
-        amb_raw = data.get("ambient_temp")
-        ambient_temp_c = float(amb_raw) if amb_raw not in (None, "") else None
 
-        output: Dict[str, Any] = {
-            "timestamp": str(data.get("Time", "")),
-            "battery_type": self.battery_type,
+        # Per-cell lists (ordered cell_1 .. cell_n)
+        # cell_voltages_mv: millivolts (3.527 V -> 3527 mV)
+        # cell_temps_c: degrees Celsius
+        # cell_ir_mohm: milliohms (0.025 ohm -> 25 mohm)
+        cell_voltages_mv = [int(round(voltages[i - 1] * 1000.0)) for i in range(1, total_cells + 1)]
+        cell_temps_c = [round(cell_temps.get(i, anchor_temp), 1) for i in range(1, total_cells + 1)]
+        cell_soh = [round(cell_soh_map.get(i, pack_soh), 2) for i in range(1, total_cells + 1)]
+        cell_ir_mohm = [int(round(cell_res.get(i, 0.0) * 1000.0)) for i in range(1, total_cells + 1)]
+
+        return {
+            "pack_soh": round(pack_soh, 2),
             "charging_state": state,
-            "soh": round(pack_soh, 4),
-            "cycle_count": self._to_float(data.get("CycleCount"), 0.0),
-            "soc": self._to_float(data.get("SOC"), 0.0),
-            "voltage_v": pack_voltage,
-            "current_a": current_signed,
-            "power_w": self._to_float(data.get("Power(W)"), 0.0),
-            "remaining_capacity_ah": self._to_float(data.get("RemainCap"), 0.0),
-            "ambient_temp_c": ambient_temp_c,
+            "cell_voltages_mv": cell_voltages_mv,
+            "cell_temps_c": cell_temps_c,
+            "cell_soh": cell_soh,
+            "cell_ir_mohm": cell_ir_mohm,
             "estimated_pack_temp_c": round(est_pack_temp, 2),
             "total_cells": total_cells,
         }
 
-        for i in range(1, total_cells + 1):
-            output[f"cell_{i}_soh"] = round(cell_soh.get(i, pack_soh), 4)
-            output[f"cell_{i}_internal_resistance_mohm"] = round(cell_res.get(i, 0.0) * 1000.0, 3)
-            output[f"cell_{i}_temp_c"] = round(cell_temps.get(i, anchor_temp), 2)
 
-        return output
+def validate_input_event(event: Dict[str, Any]) -> None:
+    """Validate the input envelope. Engine logic reads from payload.raw_payload."""
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("Missing or invalid 'payload'")
 
+    if not payload.get("pack_id"):
+        raise ValueError("Missing field: payload.pack_id")
 
-def validate_snapshot(data: Dict[str, Any]) -> None:
-    if "total_cells" not in data or data["total_cells"] is None:
-        raise ValueError("Missing field: total_cells")
+    raw = payload.get("raw_payload")
+    if not isinstance(raw, dict):
+        raise ValueError("Missing or invalid 'payload.raw_payload'")
+
+    if "total_cells" not in raw or raw["total_cells"] is None:
+        raise ValueError("Missing field: raw_payload.total_cells")
 
     try:
-        n = int(data["total_cells"])
+        n = int(raw["total_cells"])
     except (TypeError, ValueError):
-        raise ValueError(f"total_cells is not an integer: {data['total_cells']!r}")
+        raise ValueError(f"total_cells is not an integer: {raw['total_cells']!r}")
 
     if n <= 0:
         raise ValueError(f"total_cells must be positive: {n}")
 
     missing_cells = [
         f"Cell_{i}" for i in range(1, n + 1)
-        if f"Cell_{i}" not in data or data[f"Cell_{i}"] is None
+        if f"Cell_{i}" not in raw or raw[f"Cell_{i}"] is None
     ]
     if missing_cells:
         raise ValueError(f"Missing cell voltages: {missing_cells}")
+
+
+def validate_output_event(event: Dict[str, Any]) -> None:
+    """Validate the enriched output envelope before publishing."""
+    payload = event.get("payload", {})
+
+    if not payload.get("pack_id"):
+        raise ValueError("Output missing pack_id")
+
+    raw = payload.get("raw_payload", {})
+    total_cells = int(raw.get("total_cells", 0))
+
+    list_fields = ("cell_voltages_mv", "cell_temps_c", "cell_soh", "cell_ir_mohm")
+    lengths = {f: len(payload.get(f, [])) for f in list_fields}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"Cell list lengths are not equal: {lengths}")
+    if total_cells > 0 and lengths["cell_voltages_mv"] != total_cells:
+        raise ValueError(
+            f"Cell list length {lengths['cell_voltages_mv']} != total_cells {total_cells}"
+        )
+
+    soh = payload.get("soh_pct")
+    if soh is None or not (0.0 <= float(soh) <= 100.0):
+        raise ValueError(f"soh_pct out of range [0,100]: {soh}")
 
 # ENGINE STORE — per-pack engine instances guarded by per-pack locks
 
@@ -544,20 +580,92 @@ class EngineStore:
                 self._pack_locks[pack_id] = lock
             return lock
 
-    def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        pack_id = str(data.get("pack_id") or data.get("hardware_version") or "default")
+    def process(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        payload = event["payload"]
+        raw = payload["raw_payload"]
+
+        pack_id = str(payload.get("pack_id") or raw.get("pack_id")
+                      or raw.get("hardware_version") or "default")
+        # chemistry lives at payload level (renamed from old raw "battery_type")
+        chemistry = payload.get("chemistry") or raw.get("battery_type")
+
         lock = self._lock_for(pack_id)
         with lock:
             engine = self._engines.get(pack_id)
             if engine is None:
-                engine = BatteryDegradationEngine(
-                    battery_type=data.get("battery_type"),
-                )
+                engine = BatteryDegradationEngine(battery_type=chemistry)
                 self._engines[pack_id] = engine
                 log.info("Created engine for pack_id=%s type=%s", pack_id, engine.battery_type)
-            result = engine.process(data)
-        result["pack_id"] = pack_id
-        return result
+            computed = engine.process(raw)
+
+        return self._build_output_event(event, computed)
+
+    @staticmethod
+    def _build_output_event(event: Dict[str, Any], computed: Dict[str, Any]) -> Dict[str, Any]:
+        in_payload = event["payload"]
+        raw = in_payload["raw_payload"]
+
+        pack_id = str(in_payload.get("pack_id") or raw.get("pack_id"))
+        recorded_at = in_payload.get("recorded_at", "")
+        nominal_voltage_v = in_payload.get("nominal_voltage_v")
+        if nominal_voltage_v is None:
+            nominal_voltage_v = BatteryDegradationEngine._to_float(raw.get("nominal_voltage_v"), 0.0)
+
+        pack_voltage_v = BatteryDegradationEngine._to_float(
+            raw.get("Voltage(V)", raw.get("TotalVol")), 0.0
+        )
+        delta_v = round(float(nominal_voltage_v) - pack_voltage_v, 2)
+
+        # event_id = sha256(pack_id || recorded_at || model_version)
+        event_id = hashlib.sha256(
+            f"{pack_id}{recorded_at}{MODEL_VERSION}".encode("utf-8")
+        ).hexdigest()
+
+        occurred_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") \
+            + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+
+        soc = BatteryDegradationEngine._to_float(raw.get("SOC"), 0.0)
+        current_ma = int(round(BatteryDegradationEngine._to_float(raw.get("Current"), 0.0) * 1000.0))
+        pack_voltage_mv = int(round(pack_voltage_v * 1000.0))
+        pack_temp_c = round(computed["estimated_pack_temp_c"], 1)
+        amb_raw = raw.get("ambient_temp")
+        ambient_temp_c = round(float(amb_raw), 1) if amb_raw not in (None, "") else None
+        cycle_count = int(BatteryDegradationEngine._to_float(raw.get("CycleCount"), 0.0))
+
+        out_payload: Dict[str, Any] = {
+            "pack_id": pack_id,
+            "tenant_id": in_payload.get("tenant_id"),
+            "recorded_at": recorded_at,
+
+            "chemistry": in_payload.get("chemistry"),
+            "nominal_voltage_v": nominal_voltage_v,
+
+            "cell_voltages_mv": computed["cell_voltages_mv"],
+            "cell_temps_c": computed["cell_temps_c"],
+            "cell_soh": computed["cell_soh"],
+            "cell_ir_mohm": computed["cell_ir_mohm"],
+            "current_ma": current_ma,
+            "soc_pct": int(round(soc)),
+            "pack_voltage_mv": pack_voltage_mv,
+            "pack_temp_c": pack_temp_c,
+            "ambient_temp_c": ambient_temp_c,
+            "cycle_count": cycle_count,
+            "delta_v": delta_v,
+            "soh_pct": computed["pack_soh"],
+            "model_version": MODEL_VERSION,
+
+            "source": in_payload.get("source"),
+            "raw_payload": raw,
+        }
+
+        return {
+            "event_id": event_id,
+            "event_type": OUTPUT_EVENT_TYPE,
+            "tenant_id": event.get("tenant_id"),
+            "occurred_at": occurred_at,
+            "event_version": event.get("event_version"),
+            "payload": out_payload,
+        }
 
 # OUTPUT PUBLISHER — batched PutRecords with partial-failure retry
 
@@ -596,7 +704,7 @@ class OutputPublisher:
         entries = [
             {
                 "Data": json.dumps(r).encode("utf-8"),
-                "PartitionKey": str(r["pack_id"]),
+                "PartitionKey": str(r.get("payload", {}).get("pack_id", "default")),
             }
             for r in batch
         ]
@@ -777,24 +885,33 @@ class ShardConsumer(threading.Thread):
 
     def _handle_record(self, record: Dict[str, Any]) -> None:
         try:
-            payload = json.loads(record["Data"].decode("utf-8"))
+            event = json.loads(record["Data"].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             log.error("Shard %s: invalid JSON payload (seq=%s): %s",
                       self.shard_id, record.get("SequenceNumber"), e)
             return
 
         try:
-            validate_snapshot(payload)
+            validate_input_event(event)
         except ValueError as e:
-            log.error("Shard %s: validation failed (pack_id=%s seq=%s): %s",
-                      self.shard_id, payload.get("pack_id"), record.get("SequenceNumber"), e)
+            log.error("Shard %s: input validation failed (pack_id=%s seq=%s): %s",
+                      self.shard_id, event.get("payload", {}).get("pack_id"),
+                      record.get("SequenceNumber"), e)
             return
 
         try:
-            result = self._engines.process(payload)
+            result = self._engines.process(event)
         except Exception:
             log.exception("Shard %s: engine processing failed (pack_id=%s)",
-                          self.shard_id, payload.get("pack_id"))
+                          self.shard_id, event.get("payload", {}).get("pack_id"))
+            return
+
+        try:
+            validate_output_event(result)
+        except ValueError as e:
+            log.error("Shard %s: output validation failed (pack_id=%s seq=%s): %s",
+                      self.shard_id, result.get("payload", {}).get("pack_id"),
+                      record.get("SequenceNumber"), e)
             return
 
         self._publisher.enqueue(result)
