@@ -499,7 +499,7 @@ class BatteryDegradationEngine:
             "charging_state": state,
             "cell_voltages_mv": cell_voltages_mv,
             "cell_temps_c": cell_temps_c,
-            "cell_soh": cell_soh,
+            "cell_soh_pct": cell_soh,
             "cell_ir_mohm": cell_ir_mohm,
             "estimated_pack_temp_c": round(est_pack_temp, 2),
             "total_cells": total_cells,
@@ -548,13 +548,22 @@ def validate_output_event(event: Dict[str, Any]) -> None:
     raw = payload.get("raw_payload", {})
     total_cells = int(raw.get("total_cells", 0))
 
-    list_fields = ("cell_voltages_mv", "cell_temps_c", "cell_soh", "cell_ir_mohm")
+    list_fields = (
+        "cell_voltages_mv", "cell_temps_c", "cell_soh_pct", "cell_ir_mohm",
+        "cell_capacity_nominal_ah", "cell_capacity_predicted_ah",
+    )
     lengths = {f: len(payload.get(f, [])) for f in list_fields}
-    if len(set(lengths.values())) != 1:
-        raise ValueError(f"Cell list lengths are not equal: {lengths}")
-    if total_cells > 0 and lengths["cell_voltages_mv"] != total_cells:
+    if total_cells > 0:
+        mismatched = {f: n for f, n in lengths.items() if n != total_cells}
+        if mismatched:
+            raise ValueError(
+                "this output is not containing equal-length cell lists; "
+                f"expected length {total_cells} (== total_cells) but got "
+                f"{mismatched}"
+            )
+    elif len(set(lengths.values())) != 1:
         raise ValueError(
-            f"Cell list length {lengths['cell_voltages_mv']} != total_cells {total_cells}"
+            f"this output is not containing equal-length cell lists: {lengths}"
         )
 
     soh = payload.get("soh_pct")
@@ -632,6 +641,20 @@ class EngineStore:
         ambient_temp_c = round(float(amb_raw), 1) if amb_raw not in (None, "") else None
         cycle_count = int(BatteryDegradationEngine._to_float(raw.get("CycleCount"), 0.0))
 
+        # Per-cell capacity: predicted (present) capacity = nominal * SoH/100.
+        # cell_capacity_nominal_ah arrives at the payload level. If absent or a
+        # mismatched length, predicted is left empty (length validation downstream
+        # will flag it) rather than guessing.
+        cell_soh_pct = computed["cell_soh_pct"]
+        cell_capacity_nominal_ah = in_payload.get("cell_capacity_nominal_ah") or []
+        cell_capacity_predicted_ah: List[float] = []
+        if (isinstance(cell_capacity_nominal_ah, list)
+                and len(cell_capacity_nominal_ah) == len(cell_soh_pct)):
+            cell_capacity_predicted_ah = [
+                round(BatteryDegradationEngine._to_float(nom, 0.0) * (soh / 100.0), 4)
+                for nom, soh in zip(cell_capacity_nominal_ah, cell_soh_pct)
+            ]
+
         out_payload: Dict[str, Any] = {
             "pack_id": pack_id,
             "tenant_id": in_payload.get("tenant_id"),
@@ -642,8 +665,10 @@ class EngineStore:
 
             "cell_voltages_mv": computed["cell_voltages_mv"],
             "cell_temps_c": computed["cell_temps_c"],
-            "cell_soh": computed["cell_soh"],
+            "cell_soh_pct": computed["cell_soh_pct"],
             "cell_ir_mohm": computed["cell_ir_mohm"],
+            "cell_capacity_nominal_ah": cell_capacity_nominal_ah,
+            "cell_capacity_predicted_ah": cell_capacity_predicted_ah,
             "current_ma": current_ma,
             "soc_pct": int(round(soc)),
             "pack_voltage_mv": pack_voltage_mv,
